@@ -1,0 +1,397 @@
+//=====[Libraries]=============================================================
+
+#include "mbed.h"
+#include "arm_book_lib.h"
+
+//=====[Defines]===============================================================
+
+#define NUMBER_OF_KEYS                          4
+#define BLINKING_TIME_GAS_ALARM              1000
+#define BLINKING_TIME_OVER_TEMP_ALARM         500
+#define BLINKING_TIME_GAS_AND_OVER_TEMP_ALARM 100
+#define NUMBER_OF_AVG_SAMPLES                 100
+#define TIME_INCREMENT_MS                      10
+
+//=====[Objects]===============================================================
+
+DigitalIn enterButton(BUTTON1);
+DigitalIn alarmTestButton(D2);
+DigitalIn aButton(D4);
+DigitalIn bButton(D5);
+DigitalIn cButton(D6);
+DigitalIn dButton(D7);
+DigitalIn mq2(PE_12);
+
+DigitalOut alarmLed(LED1);
+DigitalOut incorrectCodeLed(LED3);
+DigitalOut systemBlockedLed(LED2);
+
+DigitalInOut sirenPin(PE_10);
+
+UnbufferedSerial uartUsb(USBTX, USBRX, 115200);
+
+AnalogIn potentiometer(A0);  // potentiometer on A0
+AnalogIn lm35(A1);           // LM35 on A1
+
+//=====[Global Variables]======================================================
+
+bool alarmState            = OFF;
+bool incorrectCode         = false;
+bool overTempDetector      = OFF;
+bool gasDetectorState      = OFF;
+bool overTempDetectorState = OFF;
+
+bool tempWarning           = false;
+bool gasWarning            = false;
+bool buzzerOn              = false; // Subtask iv: tracks buzzer state
+
+int numberOfIncorrectCodes         = 0;
+int buttonBeingCompared            = 0;
+int accumulatedTimeAlarm           = 0;
+int printTimer                     = 0;
+int codeSequence[NUMBER_OF_KEYS]   = { 1, 1, 0, 0 };
+int buttonsPressed[NUMBER_OF_KEYS] = { 0, 0, 0, 0 };
+
+float lm35ReadingsArray[NUMBER_OF_AVG_SAMPLES];
+float lm35ReadingsSum      = 0.0f;
+float lm35ReadingsAverage  = 0.0f;
+float lm35TempC            = 0.0f;
+float potentiometerReading = 0.0f;
+float sensitivityThreshold = 50.0f;
+
+//=====[Prototypes]============================================================
+
+void inputsInit();
+void outputsInit();
+void readSensors();
+void evaluateWarnings();
+void buzzerUpdate();                // Subtask iv: new
+void alarmActivationUpdate();
+void alarmDeactivationUpdate();
+void continuousPrint();
+void uartTask();
+void availableCommands();
+bool areEqual();
+float celsiusToFahrenheit(float tempInCelsiusDegrees);
+
+//=====[Main]=================================================================
+
+int main()
+{
+    inputsInit();
+    outputsInit();
+    while (true) {
+        readSensors();
+        evaluateWarnings();
+        buzzerUpdate();             // Subtask iv: runs every loop tick
+        alarmActivationUpdate();
+        alarmDeactivationUpdate();
+        continuousPrint();
+        uartTask();
+        delay(TIME_INCREMENT_MS);
+    }
+}
+
+//=====[Implementations]======================================================
+
+void inputsInit()
+{
+    alarmTestButton.mode(PullDown);
+    aButton.mode(PullDown);
+    bButton.mode(PullDown);
+    cButton.mode(PullDown);
+    dButton.mode(PullDown);
+    sirenPin.mode(OpenDrain);
+    sirenPin.input();
+}
+
+void outputsInit()
+{
+    alarmLed         = OFF;
+    incorrectCodeLed = OFF;
+    systemBlockedLed = OFF;
+}
+
+void readSensors()
+{
+    static int lm35SampleIndex = 0;
+
+    // --- LM35 rolling average (A1) ---
+    lm35ReadingsArray[lm35SampleIndex] = lm35.read();
+    lm35SampleIndex = (lm35SampleIndex + 1) % NUMBER_OF_AVG_SAMPLES;
+
+    lm35ReadingsSum = 0.0f;
+    for (int i = 0; i < NUMBER_OF_AVG_SAMPLES; i++) {
+        lm35ReadingsSum += lm35ReadingsArray[i];
+    }
+    lm35ReadingsAverage = lm35ReadingsSum / NUMBER_OF_AVG_SAMPLES;
+    lm35TempC           = lm35ReadingsAverage * 330.0f;
+
+    // --- Potentiometer (A0) -> threshold 0 to 100 ---
+    potentiometerReading = potentiometer.read();
+    sensitivityThreshold = potentiometerReading * 100.0f;
+}
+
+void evaluateWarnings()
+{
+    tempWarning = (lm35TempC > sensitivityThreshold);
+    gasWarning  = (!mq2);
+}
+
+//-----------------------------------------------------------------------------
+// Subtask iv: activate buzzer if either warning is triggered.
+// Sends "Buzzer ON - Cause: [Temperature/Gas/Temperature and Gas]" once
+// when buzzer first turns on, avoids spamming the terminal every loop tick.
+//-----------------------------------------------------------------------------
+void buzzerUpdate()
+{
+    static bool lastBuzzerOn = false;
+
+    if (tempWarning || gasWarning) {
+        // Activate buzzer via sirenPin
+        sirenPin.output();
+        sirenPin = LOW;
+        buzzerOn = true;
+    } else {
+        // No warnings — buzzer off
+        sirenPin.input();
+        buzzerOn = false;
+    }
+
+    // Only print buzzer message when state changes to ON
+    if (buzzerOn && !lastBuzzerOn) {
+        if (tempWarning && gasWarning) {
+            uartUsb.write("Buzzer ON - Cause: Temperature and Gas\r\n", 40);
+        } else if (tempWarning) {
+            uartUsb.write("Buzzer ON - Cause: Temperature\r\n", 32);
+        } else if (gasWarning) {
+            uartUsb.write("Buzzer ON - Cause: Gas\r\n", 24);
+        }
+    }
+
+    lastBuzzerOn = buzzerOn;
+}
+
+void alarmActivationUpdate()
+{
+    if (tempWarning) {
+        overTempDetector      = ON;
+        overTempDetectorState = ON;
+        alarmState            = ON;
+    } else {
+        overTempDetector = OFF;
+    }
+
+    if (gasWarning) {
+        gasDetectorState = ON;
+        alarmState       = ON;
+    }
+
+    if (alarmTestButton) {
+        overTempDetectorState = ON;
+        gasDetectorState      = ON;
+        alarmState            = ON;
+    }
+
+    if (alarmState) {
+        accumulatedTimeAlarm += TIME_INCREMENT_MS;
+
+        if (gasDetectorState && overTempDetectorState) {
+            if (accumulatedTimeAlarm >= BLINKING_TIME_GAS_AND_OVER_TEMP_ALARM) {
+                accumulatedTimeAlarm = 0;
+                alarmLed = !alarmLed;
+            }
+        } else if (gasDetectorState) {
+            if (accumulatedTimeAlarm >= BLINKING_TIME_GAS_ALARM) {
+                accumulatedTimeAlarm = 0;
+                alarmLed = !alarmLed;
+            }
+        } else if (overTempDetectorState) {
+            if (accumulatedTimeAlarm >= BLINKING_TIME_OVER_TEMP_ALARM) {
+                accumulatedTimeAlarm = 0;
+                alarmLed = !alarmLed;
+            }
+        }
+    } else {
+        alarmLed              = OFF;
+        gasDetectorState      = OFF;
+        overTempDetectorState = OFF;
+    }
+}
+
+void alarmDeactivationUpdate()
+{
+    if (numberOfIncorrectCodes < 5) {
+        if (aButton && bButton && cButton && dButton && !enterButton) {
+            incorrectCodeLed = OFF;
+        }
+        if (enterButton && !incorrectCodeLed && alarmState) {
+            buttonsPressed[0] = aButton;
+            buttonsPressed[1] = bButton;
+            buttonsPressed[2] = cButton;
+            buttonsPressed[3] = dButton;
+            if (areEqual()) {
+                alarmState             = OFF;
+                numberOfIncorrectCodes = 0;
+            } else {
+                incorrectCodeLed = ON;
+                numberOfIncorrectCodes++;
+            }
+        }
+    } else {
+        systemBlockedLed = ON;
+    }
+}
+
+void continuousPrint()
+{
+    char str[150];
+    printTimer += TIME_INCREMENT_MS;
+    if (printTimer >= 500) {
+        printTimer = 0;
+
+        if (!tempWarning && !gasWarning) {
+            // Subtask v: no warnings active — show live readings and System Normal
+            sprintf(str,
+                "Temp: %.1f C | Threshold: %.0f | Gas: clear | Buzzer: off | System Normal\r\n",
+                lm35TempC,
+                sensitivityThreshold);
+        } else {
+            // Warnings active — show what triggered
+            char warningStr[50];
+            if (tempWarning && gasWarning) {
+                sprintf(warningStr, "TEMPERATURE + GAS WARNING");
+            } else if (tempWarning) {
+                sprintf(warningStr, "TEMPERATURE WARNING");
+            } else {
+                sprintf(warningStr, "GAS WARNING");
+            }
+            sprintf(str,
+                "Temp: %.1f C | Threshold: %.0f | Warning: %s | Buzzer: ON\r\n",
+                lm35TempC,
+                sensitivityThreshold,
+                warningStr);
+        }
+
+        uartUsb.write(str, strlen(str));
+    }
+}
+
+void uartTask()
+{
+    char receivedChar = '\0';
+    char str[100];
+
+    if (uartUsb.readable()) {
+        uartUsb.read(&receivedChar, 1);
+        switch (receivedChar) {
+
+        case '1':
+            uartUsb.write(alarmState ? "Alarm: ON\r\n" : "Alarm: OFF\r\n",
+                          alarmState ? 11 : 12);
+            break;
+
+        case '2':
+            uartUsb.write(gasWarning ? "Gas: DETECTED\r\n" : "Gas: clear\r\n",
+                          gasWarning ? 15 : 12);
+            break;
+
+        case '3':
+            uartUsb.write(tempWarning ? "Temp: ABOVE threshold\r\n"
+                                      : "Temp: below threshold\r\n", 23);
+            break;
+
+        case '4':
+            uartUsb.write("Please enter the code sequence.\r\n", 33);
+            uartUsb.write("Enter A B C D as 1 (pressed) or 0 (not pressed)\r\n", 49);
+
+            incorrectCode = false;
+            for (buttonBeingCompared = 0;
+                 buttonBeingCompared < NUMBER_OF_KEYS;
+                 buttonBeingCompared++) {
+
+                uartUsb.read(&receivedChar, 1);
+                uartUsb.write("*", 1);
+
+                if      (receivedChar == '1') { if (codeSequence[buttonBeingCompared] != 1) incorrectCode = true; }
+                else if (receivedChar == '0') { if (codeSequence[buttonBeingCompared] != 0) incorrectCode = true; }
+                else                          { incorrectCode = true; }
+            }
+
+            if (!incorrectCode) {
+                uartUsb.write("\r\nCode correct\r\n\r\n", 18);
+                alarmState             = OFF;
+                incorrectCodeLed       = OFF;
+                numberOfIncorrectCodes = 0;
+            } else {
+                uartUsb.write("\r\nCode incorrect\r\n\r\n", 20);
+                incorrectCodeLed = ON;
+                numberOfIncorrectCodes++;
+            }
+            break;
+
+        case '5':
+            uartUsb.write("Enter new code (A B C D as 1 or 0):\r\n", 37);
+            for (buttonBeingCompared = 0;
+                 buttonBeingCompared < NUMBER_OF_KEYS;
+                 buttonBeingCompared++) {
+
+                uartUsb.read(&receivedChar, 1);
+                uartUsb.write("*", 1);
+                if      (receivedChar == '1') codeSequence[buttonBeingCompared] = 1;
+                else if (receivedChar == '0') codeSequence[buttonBeingCompared] = 0;
+            }
+            uartUsb.write("\r\nNew code saved\r\n\r\n", 20);
+            break;
+
+        case 'c':
+        case 'C':
+            sprintf(str, "Temperature: %.2f C\r\n", lm35TempC);
+            uartUsb.write(str, strlen(str));
+            break;
+
+        case 'f':
+        case 'F':
+            sprintf(str, "Temperature: %.2f F\r\n", celsiusToFahrenheit(lm35TempC));
+            uartUsb.write(str, strlen(str));
+            break;
+
+        case 'p':
+        case 'P':
+            sprintf(str, "Pot: %.2f | Threshold: %.0f\r\n",
+                    potentiometerReading, sensitivityThreshold);
+            uartUsb.write(str, strlen(str));
+            break;
+
+        default:
+            availableCommands();
+            break;
+        }
+    }
+}
+
+void availableCommands()
+{
+    uartUsb.write("Commands:\r\n", 11);
+    uartUsb.write("'1' alarm state\r\n", 17);
+    uartUsb.write("'2' gas state\r\n", 15);
+    uartUsb.write("'3' temperature warning state\r\n", 31);
+    uartUsb.write("'4' enter code\r\n", 16);
+    uartUsb.write("'5' set new code\r\n", 18);
+    uartUsb.write("'c' temperature in C\r\n", 22);
+    uartUsb.write("'f' temperature in F\r\n", 22);
+    uartUsb.write("'p' potentiometer and threshold\r\n\r\n", 35);
+}
+
+bool areEqual()
+{
+    for (int i = 0; i < NUMBER_OF_KEYS; i++) {
+        if (codeSequence[i] != buttonsPressed[i]) return false;
+    }
+    return true;
+}
+
+float celsiusToFahrenheit(float tempInCelsiusDegrees)
+{
+    return (tempInCelsiusDegrees * 9.0f / 5.0f + 32.0f);
+}
